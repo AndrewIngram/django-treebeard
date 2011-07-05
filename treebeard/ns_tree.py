@@ -9,6 +9,11 @@ from django.db import models, transaction, connection
 from treebeard.models import Node
 from treebeard.exceptions import InvalidMoveToDescendant
 
+try:
+    from django.db import connections, router
+except ImportError:
+    connections = None
+    router = None
 
 class NS_NodeQuerySet(models.query.QuerySet):
     """
@@ -90,6 +95,27 @@ class NS_Node(Node):
     depth = models.PositiveIntegerField(db_index=True)
 
     objects = NS_NodeManager()
+    
+    @classmethod
+    def commit_unless_managed(cls):
+        if connections is None:
+            transaction.commit_unless_managed()
+        else:
+            transaction.commit_unless_managed(using=router.db_for_write(cls))
+    
+    @classmethod
+    def read_connection(cls):
+        if connections is None:
+            return connection
+        else:
+            return connections[router.db_for_read(cls)]
+        
+    @classmethod        
+    def write_connection(cls):
+        if connections is None:
+            return connection
+        else:
+            return connections[router.db_for_write(cls)]    
 
     @classmethod
     def add_root(cls, **kwargs):
@@ -136,7 +162,7 @@ class NS_Node(Node):
               '                ELSE rgt END ' \
               ' WHERE rgt >= %(parent_rgt)d AND ' \
               '       tree_id = %(tree_id)s' % {
-                  'table': connection.ops.quote_name(cls._meta.db_table),
+                  'table': cls.write_connection().ops.quote_name(cls._meta.db_table),
                   'parent_rgt': rgt,
                   'tree_id': tree_id,
                   'lftop': lftop,
@@ -148,7 +174,7 @@ class NS_Node(Node):
         sql = 'UPDATE %(table)s ' \
               ' SET tree_id = tree_id+1 ' \
               ' WHERE tree_id >= %(tree_id)d' % {
-                  'table': connection.ops.quote_name(cls._meta.db_table),
+                  'table': cls.write_connection().ops.quote_name(cls._meta.db_table),
                   'tree_id': tree_id}
         return sql, []
 
@@ -180,12 +206,12 @@ class NS_Node(Node):
 
         newobj._cached_parent_obj = self
 
-        cursor = connection.cursor()
+        cursor = self.__class__.write_connection().cursor()
         cursor.execute(sql, params)
 
         # saving the instance before returning it
         newobj.save()
-        transaction.commit_unless_managed()
+        self.__class__.commit_unless_managed()
 
         return newobj
 
@@ -274,11 +300,11 @@ class NS_Node(Node):
 
         # saving the instance before returning it
         if sql:
-            cursor = connection.cursor()
+            cursor = self.__class__.write_connection().cursor()
             cursor.execute(sql, params)
         newobj.save()
 
-        transaction.commit_unless_managed()
+        self.__class__.commit_unless_managed()
 
         return newobj
 
@@ -346,7 +372,7 @@ class NS_Node(Node):
                 target = siblings[0]
 
         # ok let's move this
-        cursor = connection.cursor()
+        cursor = self.__class__.write_connection().cursor()
         move_right = cls._move_right
         gap = self.rgt - self.lft + 1
         sql = None
@@ -410,7 +436,7 @@ class NS_Node(Node):
             fromobj.rgt, fromobj.tree_id)
         cursor.execute(sql, params)
 
-        transaction.commit_unless_managed()
+        self.__class__.commit_unless_managed()
 
     @classmethod
     def _get_close_gap_sql(cls, drop_lft, drop_rgt, tree_id):
@@ -426,7 +452,7 @@ class NS_Node(Node):
               ' WHERE (lft > %(drop_lft)d ' \
               '     OR rgt > %(drop_lft)d) AND '\
               '     tree_id=%(tree_id)d' % {
-                  'table': connection.ops.quote_name(cls._meta.db_table),
+                  'table': cls.write_connection().ops.quote_name(cls._meta.db_table),
                   'gapsize': drop_rgt - drop_lft + 1,
                   'drop_lft': drop_lft,
                   'tree_id': tree_id}
@@ -461,7 +487,7 @@ class NS_Node(Node):
                 # the new nodes
                 stack.extend([(node_obj.id, node) \
                     for node in node_struct['children'][::-1]])
-        transaction.commit_unless_managed()
+        cls.commit_unless_managed()
         return added
 
     def get_children(self):

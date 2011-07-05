@@ -6,6 +6,11 @@ from django.db import models, transaction, connection
 from treebeard.models import Node
 from treebeard.exceptions import InvalidMoveToDescendant
 
+try:
+    from django.db import connections, router
+except ImportError:
+    connections = None
+    router = None
 
 class AL_NodeManager(models.Manager):
     "Custom manager for nodes."
@@ -25,6 +30,27 @@ class AL_Node(Node):
 
     objects = AL_NodeManager()
     node_order_by = None
+    
+    @classmethod
+    def commit_unless_managed(cls):
+        if connections is None:
+            transaction.commit_unless_managed()
+        else:
+            transaction.commit_unless_managed(using=router.db_for_write(cls))
+    
+    @classmethod
+    def read_connection(cls):
+        if connections is None:
+            return connection
+        else:
+            return connections[router.db_for_read(cls)]
+        
+    @classmethod        
+    def write_connection(cls):
+        if connections is None:
+            return connection
+        else:
+            return connections[router.db_for_write(cls)]      
 
     @classmethod
     def add_root(cls, **kwargs):
@@ -42,7 +68,7 @@ class AL_Node(Node):
 
         # saving the instance before returning it
         newobj.save()
-        transaction.commit_unless_managed()
+        cls.commit_unless_managed()
         return newobj
 
     @classmethod
@@ -172,7 +198,7 @@ class AL_Node(Node):
         # saving the instance before returning it
         newobj.parent = self
         newobj.save()
-        transaction.commit_unless_managed()
+        self.__class__.commit_unless_managed()
         return newobj
 
     @classmethod
@@ -238,13 +264,13 @@ class AL_Node(Node):
         if self.parent_id:
             newobj.parent_id = self.parent_id
 
-        cursor = connection.cursor()
+        cursor = self.__class__.write_connection().cursor()
         for sql, vals in stmts:
             cursor.execute(sql, vals)
 
         # saving the instance before returning it
         newobj.save()
-        transaction.commit_unless_managed()
+        self.__class__.commit_unless_managed()
         return newobj
 
     @classmethod
@@ -277,7 +303,7 @@ class AL_Node(Node):
                       ' SET sib_order=sib_order+1' \
                       ' WHERE sib_order >= %%s' \
                       ' AND ' % {'table':
-                                connection.ops.quote_name(cls._meta.db_table)}
+                                cls.write_connection().ops.quote_name(cls._meta.db_table)}
                 params = [min]
                 if target.is_root():
                     sql += 'parent_id IS NULL'
@@ -344,12 +370,12 @@ class AL_Node(Node):
                 self.parent = target.parent
 
         if stmts:
-            cursor = connection.cursor()
+            cursor = self.__class__.write_connection().cursor()
             for sql, vals in stmts:
                 cursor.execute(sql, vals)
 
         self.save()
-        transaction.commit_unless_managed()
+        self.__class__.commit_unless_managed()
 
     class Meta:
         "Abstract model."
