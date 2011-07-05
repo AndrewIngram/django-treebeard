@@ -10,6 +10,12 @@ from django.db.models import Q
 from treebeard.models import Node
 from treebeard.exceptions import InvalidMoveToDescendant, PathOverflow
 
+try:
+    from django.db import connections, router
+except ImportError:
+    connections = None
+    router = None
+
 
 class MP_NodeQuerySet(models.query.QuerySet):
     """
@@ -239,6 +245,27 @@ class MP_Node(Node):
         return evil_chars, bad_steplen, orphans, wrong_depth, wrong_numchild
 
     @classmethod
+    def commit_unless_managed(cls):
+        if connections is None:
+            transaction.commit_unless_managed()
+        else:
+            transaction.commit_unless_managed(using=router.db_for_write(cls))
+    
+    @classmethod
+    def read_connection(cls):
+        if connections is None:
+            return connection
+        else:
+            return connections[router.db_for_read(cls)]
+        
+    @classmethod        
+    def write_connection(cls):
+        if connections is None:
+            return connection
+        else:
+            return connections[router.db_for_write(cls)]
+
+    @classmethod
     def fix_tree(cls, destructive=False):
         """
         Solves some problems that can appear when transactions are not used and
@@ -281,17 +308,17 @@ class MP_Node(Node):
             cls.objects.all().delete()
             cls.load_bulk(dump, None, True)
         else:
-
-            cursor = connection.cursor()
+            read_cursor = cls.read_connection().cursor()
+            write_cursor = cls.write_connection().cursor()
 
             # fix the depth field
             # we need the WHERE to speed up postgres
             sql = "UPDATE %s " \
                     "SET depth=LENGTH(path)/%%s " \
                   "WHERE depth!=LENGTH(path)/%%s" % (
-                      connection.ops.quote_name(cls._meta.db_table), )
+                      cls.write_connection().ops.quote_name(cls._meta.db_table), )
             vals = [cls.steplen, cls.steplen]
-            cursor.execute(sql, vals)
+            cls.write_connection().cursor().execute(sql, vals)
 
             # fix the numchild field
             vals = ['_' * cls.steplen]
@@ -304,7 +331,7 @@ class MP_Node(Node):
                                 "CONCAT(tbn1.path, %%s)) AS real_numchild " \
                       "FROM %(table)s AS tbn1 " \
                       "HAVING tbn1.numchild != real_numchild" % {
-                        'table': connection.ops.quote_name(cls._meta.db_table)}
+                        'table': cls.read_connection().ops.quote_name(cls._meta.db_table)}
             else:
                 subquery = "(SELECT COUNT(1) FROM %(table)s AS tbn2" \
                            " WHERE tbn2.path LIKE tbn1.path||%%s)"
@@ -312,19 +339,19 @@ class MP_Node(Node):
                       "FROM %(table)s AS tbn1 " \
                       "WHERE tbn1.numchild != " + subquery
                 sql = sql % {
-                        'table': connection.ops.quote_name(cls._meta.db_table)}
+                        'table': cls.read_connection().ops.quote_name(cls._meta.db_table)}
                 # we include the subquery twice
                 vals *= 2
-            cursor.execute(sql, vals)
+            read_cursor.execute(sql, vals)
             sql = "UPDATE %(table)s " \
                      "SET numchild=%%s " \
                    "WHERE path=%%s" % {
-                     'table': connection.ops.quote_name(cls._meta.db_table)}
-            for node_data in cursor.fetchall():
+                     'table': cls.write_connection().ops.quote_name(cls._meta.db_table)}
+            for node_data in read_cursor.fetchall():
                 vals = [node_data[2], node_data[0]]
-                cursor.execute(sql, vals)
+                write_cursor.execute(sql, vals)
 
-            transaction.commit_unless_managed()
+            cls.commit_unless_managed()
 
     @classmethod
     def get_tree(cls, parent=None):
@@ -373,6 +400,7 @@ class MP_Node(Node):
         # If there is a better way to do this in an UNMODIFIED django 1.0, let
         # me know.
         #~
+        read_cursor = cls.read_connection().cursor()
 
         if parent:
             depth = parent.depth + 1
@@ -392,20 +420,19 @@ class MP_Node(Node):
               '   GROUP BY subpath) AS t2 ' \
               ' ON t1.path=t2.subpath ' \
               ' ORDER BY t1.path' % {
-                    'table': connection.ops.quote_name(cls._meta.db_table),
+                    'table': cls.read_connection().ops.quote_name(cls._meta.db_table),
                     'subpathlen': depth * cls.steplen,
                     'depth': depth,
                     'extrand': extrand}
-        cursor = connection.cursor()
-        cursor.execute(sql, params)
+        read_cursor.execute(sql, params)
 
         ret = []
-        field_names = [field[0] for field in cursor.description]
-        for node_data in cursor.fetchall():
+        field_names = [field[0] for field in read_cursor.description]
+        for node_data in read_cursor.fetchall():
             node = cls(**dict(zip(field_names, node_data[:-2])))
             node.descendants_count = node_data[-1]
             ret.append(node)
-        transaction.commit_unless_managed()
+        cls.commit_unless_managed()
         return ret
 
     def get_depth(self):
@@ -532,11 +559,11 @@ class MP_Node(Node):
         sql = "UPDATE %(table)s " \
                  "SET numchild=numchild+1 " \
                "WHERE path=%%s" % {
-                 'table': connection.ops.quote_name(
+                 'table': self.__class__.write_connection().ops.quote_name(
                               self.__class__._meta.db_table)}
-        cursor = connection.cursor()
+        cursor = self.__class__.write_connection().cursor()
         cursor.execute(sql, [self.path])
-        transaction.commit_unless_managed()
+        self.__class__.commit_unless_managed()
 
         return newobj
 
@@ -574,7 +601,7 @@ class MP_Node(Node):
         if parentpath:
             stmts.append(self._get_sql_update_numchild(parentpath, 'inc'))
 
-        cursor = connection.cursor()
+        cursor = self._get_write_connection().cursor()
         for sql, vals in stmts:
             cursor.execute(sql, vals)
 
@@ -582,7 +609,7 @@ class MP_Node(Node):
         newobj.path = newpath
         newobj.save()
 
-        transaction.commit_unless_managed()
+        self.commit_unless_managed()
         return newobj
 
     def get_root(self):
@@ -665,10 +692,10 @@ class MP_Node(Node):
         # updates needed for mysql and children count in parents
         self._updates_after_move(oldpath, newpath, stmts)
 
-        cursor = connection.cursor()
+        cursor = self._get_write_connection().cursor()
         for sql, vals in stmts:
             cursor.execute(sql, vals)
-        transaction.commit_unless_managed()
+        self.commit_unless_managed()
 
     @classmethod
     def _get_basepath(cls, path, depth):
