@@ -601,7 +601,7 @@ class MP_Node(Node):
         if parentpath:
             stmts.append(self._get_sql_update_numchild(parentpath, 'inc'))
 
-        cursor = self._get_write_connection().cursor()
+        cursor = self.__class__.write_connection().cursor()
         for sql, vals in stmts:
             cursor.execute(sql, vals)
 
@@ -692,7 +692,7 @@ class MP_Node(Node):
         # updates needed for mysql and children count in parents
         self._updates_after_move(oldpath, newpath, stmts)
 
-        cursor = self._get_write_connection().cursor()
+        cursor = self.__class__.write_connection().cursor()
         for sql, vals in stmts:
             cursor.execute(sql, vals)
         self.commit_unless_managed()
